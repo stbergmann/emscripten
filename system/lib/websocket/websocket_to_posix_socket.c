@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -241,6 +242,7 @@ EMSCRIPTEN_WEBSOCKET_T emscripten_init_websocket_to_posix_socket_bridge(const ch
 #define POSIX_SOCKET_MSG_SETSOCKOPT 17
 #define POSIX_SOCKET_MSG_GETADDRINFO 18
 #define POSIX_SOCKET_MSG_GETNAMEINFO 19
+#define POSIX_SOCKET_MSG_POLL 20
 
 #define MAX_SOCKADDR_SIZE 256
 #define MAX_OPTIONVALUE_SIZE 16
@@ -936,6 +938,55 @@ int getnameinfo(const struct sockaddr* addr,
   // TODO
   // POSIX_SOCKET_MSG_GETNAMEINFO
   return -1;
+}
+
+int websocket_proxy_poll(struct pollfd* fds, nfds_t nfds, int timeout) {
+#ifdef POSIX_SOCKET_DEBUG
+  emscripten_log(EM_LOG_NO_PATHS | EM_LOG_CONSOLE | EM_LOG_ERROR | EM_LOG_JS_STACK, "poll(fds=%p,nfds=%u,timeout=%d)\n", fds, nfds, timeout);
+#endif
+
+  struct pollfd_in {
+    int fd;
+    short events;
+  };
+
+  typedef struct Data {
+    SocketCallHeader header;
+    uint32_t/*nfds_t*/ nfds;
+    int timeout;
+    struct pollfd_in fds[];
+  } Data;
+
+  typedef struct Result {
+    SocketCallResultHeader header;
+    short revents[];
+  } Result;
+
+  int numBytes = sizeof(Data) + nfds * sizeof(struct pollfd_in);
+  Data *d = (Data*)malloc(numBytes);
+  PosixSocketCallResult *b = allocate_call_result(sizeof(SocketCallResultHeader));
+  d->header.callId = b->callId;
+  d->header.function = POSIX_SOCKET_MSG_POLL;
+  d->nfds = nfds;
+  d->timeout = timeout;
+  for (nfds_t i = 0; i != nfds; ++i) {
+    d->fds[i].fd = fds[i].fd;
+    d->fds[i].events = fds[i].events;
+  }
+  emscripten_websocket_send_binary(bridgeSocket, d, numBytes);
+
+  wait_for_call_result(b);
+  int ret = b->data->ret;
+  if (ret != -1) {
+    Result *r = (Result*)b->data;
+    for (nfds_t i = 0; i != nfds; ++i) {
+      fds[i].revents = r->revents[i];
+    }
+  } else {
+    errno = b->data->errno_;
+  }
+  free_call_result(b);
+  return ret;
 }
 
 // TODO:

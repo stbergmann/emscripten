@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <errno.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -52,6 +53,7 @@ uint64_t ntoh64(uint64_t x) {
 #define POSIX_SOCKET_MSG_SETSOCKOPT 17
 #define POSIX_SOCKET_MSG_GETADDRINFO 18
 #define POSIX_SOCKET_MSG_GETNAMEINFO 19
+#define POSIX_SOCKET_MSG_POLL 20
 
 #define MAX_SOCKADDR_SIZE 256
 #define MAX_OPTIONVALUE_SIZE 16
@@ -1517,6 +1519,69 @@ void Getnameinfo(int client_fd, uint8_t *data, uint64_t numBytes) {
   fprintf(stderr, "TODO getnameinfo() unimplemented!\n");
 }
 
+void Poll(int client_fd, uint8_t *data, uint64_t numBytes) {
+  struct pollfd_in {
+    int fd;
+    short events;
+  };
+
+  typedef struct MSG {
+    SocketCallHeader header;
+    uint32_t/*nfds_t*/ nfds;
+    int timeout;
+    struct pollfd_in fds[];
+  } MSG;
+  MSG *d = (MSG*)data;
+
+  int ret = 0, errorCode;
+
+  struct pollfd* fds = (struct pollfd*)malloc(d->nfds * sizeof(struct pollfd));
+  if (!fds) {
+    ret = -1;
+    errorCode = ENOMEM;
+  }
+
+  if (ret == 0) {
+    for (uint32_t i = 0; i != d->nfds; ++i) {
+      if (d->fds[i].fd == -1 || IsSocketPartOfConnection(client_fd, d->fds[i].fd)) {
+        fds[i].fd = d->fds[i].fd;
+        fds[i].events = d->fds[i].events;
+      } else {
+        fprintf(stderr, "poll(): Proxy client connection client_fd=%d attempted to call poll() on a socket fd=%d that it did not create (or has already shut down)\n", client_fd, d->fds[i].fd);
+        ret = errorCode = -1;
+        break;
+      }
+    }
+  }
+
+  if (ret == 0) {
+    ret = poll(fds, d->nfds, d->timeout);
+    errorCode = (ret == -1) ? GET_SOCKET_ERROR() : 0;
+
+#ifdef POSIX_SOCKET_DEBUG
+    printf("poll(fds=%p,nfds=%u,timeout=%d)->%d\n", fds, d->nfds, d->timeout, ret);
+    if (errorCode) PRINT_SOCKET_ERROR(errorCode);
+#endif
+  }
+
+  typedef struct Result {
+    int callId;
+    int ret;
+    int errno_;
+    short revents[];
+  } Result;
+  int resultSize = sizeof(Result) + d->nfds * sizeof(short);
+  Result *r = (Result*)malloc(resultSize);
+  r->callId = d->header.callId;
+  r->ret = ret;
+  r->errno_ = errorCode;
+  for (uint32_t i = 0; i != d->nfds; ++i) {
+    r->revents[i] = fds[i].revents;
+  }
+  SendWebSocketMessage(client_fd, r, resultSize);
+  free(r);
+}
+
 static void *memdup(const void *ptr, size_t sz) {
   if (!ptr) return 0;
   void *dup = malloc(sz);
@@ -1578,6 +1643,7 @@ void ProcessWebSocketMessageSynchronouslyInCurrentThread(int client_fd, uint8_t 
     case POSIX_SOCKET_MSG_SETSOCKOPT: Setsockopt(client_fd, payload, numBytes); break;
     case POSIX_SOCKET_MSG_GETADDRINFO: Getaddrinfo(client_fd, payload, numBytes); break;
     case POSIX_SOCKET_MSG_GETNAMEINFO: Getnameinfo(client_fd, payload, numBytes); break;
+    case POSIX_SOCKET_MSG_POLL: Poll(client_fd, payload, numBytes); break;
     default:
       printf("Unknown POSIX_SOCKET_MSG %u received!\n", header->function);
       break;
